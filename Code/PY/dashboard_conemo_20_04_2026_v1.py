@@ -178,6 +178,7 @@ def clear_all_caches():
     load_users_sessions.clear()
     load_journeys.clear()
     load_patience.clear()
+    build_desc_df.clear()
 
 
 @st.cache_data
