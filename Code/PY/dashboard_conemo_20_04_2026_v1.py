@@ -57,13 +57,13 @@ FROM
   `conemo-412202.firestore_export.users_raw_latest` u
 LEFT JOIN
   `conemo-412202.firestore_export.sessions_raw_latest` s
-  ON JSON_VALUE(s.path_params, '$.userId') = u.document_id
+  ON REGEXP_EXTRACT(s.document_name, r'/users/([^/]+)/') = u.document_id
 """
 
 _QUERY_JOURNEYS = """
 SELECT
   document_id,
-  JSON_VALUE(path_params, '$.userId')             AS user_id,
+  REGEXP_EXTRACT(document_name, r'/users/([^/]+)/') AS user_id,
   JSON_VALUE(DATA, '$.type')                      AS journey_type,
   JSON_VALUE(DATA, '$.enabled')                   AS enabled,
   SAFE_CAST(JSON_VALUE(DATA, '$.lastSession') AS INT64) AS lastSession,
@@ -72,6 +72,11 @@ FROM
   `conemo-412202.firestore_export.journeys_raw_latest`
 WHERE
   JSON_VALUE(DATA, '$.enabled') = 'true'
+"""
+
+_QUERY_LAST_UPDATE = """
+SELECT MAX(timestamp) AS last_update
+FROM `conemo-412202.firestore_export.users_raw_latest`
 """
 
 _QUERY_PATIENCE = """
@@ -91,9 +96,30 @@ FROM
 # ---------------------------------------------------------------------------
 # Funções de carregamento direto do BigQuery
 # ---------------------------------------------------------------------------
+_EMPTY_USERS = pd.DataFrame(columns=[
+    "user_id", "json_data_user", "email", "firstFormTs",
+    "sessionNumber", "isCompleted", "completedDate",
+    "ubs_name", "ubs_city", "phq_score", "gad_score",
+    "gender", "age", "user_name", "education", "occupation",
+])
+_EMPTY_JOURNEYS = pd.DataFrame(columns=[
+    "document_id", "user_id", "journey_type", "enabled",
+    "lastSession", "lastAccessSeconds", "lastAccessDate",
+    "ubs_name", "ubs_city", "phq_score", "gad_score", "gender", "age",
+])
+_EMPTY_PATIENCE = pd.DataFrame(columns=[
+    "document_id", "patientId", "patientWhatsAppId", "createdAtSeconds",
+    "feedbackType", "feedback_data", "source", "sessionId", "createdAt",
+])
+
+
 @st.cache_data
 def load_users_sessions() -> pd.DataFrame:
-    df = _get_bq_client().query(_QUERY_USERS_SESSIONS).to_dataframe()
+    try:
+        df = _get_bq_client().query(_QUERY_USERS_SESSIONS).to_dataframe()
+    except Exception as exc:
+        st.error(f"Erro ao carregar usuários/sessões: {exc}")
+        return _EMPTY_USERS.copy()
 
     df["sessionNumber"] = pd.to_numeric(df["sessionNumber"], errors="coerce")
     df["isCompleted"] = (
@@ -158,7 +184,11 @@ def load_users_sessions() -> pd.DataFrame:
 
 @st.cache_data
 def load_journeys() -> pd.DataFrame:
-    df = _get_bq_client().query(_QUERY_JOURNEYS).to_dataframe()
+    try:
+        df = _get_bq_client().query(_QUERY_JOURNEYS).to_dataframe()
+    except Exception as exc:
+        st.error(f"Erro ao carregar jornadas: {exc}")
+        return _EMPTY_JOURNEYS.copy()
     df["lastAccessDate"] = pd.to_datetime(
         df["lastAccessSeconds"], unit="s", errors="coerce"
     )
@@ -167,17 +197,34 @@ def load_journeys() -> pd.DataFrame:
 
 @st.cache_data
 def load_patience() -> pd.DataFrame:
-    df = _get_bq_client().query(_QUERY_PATIENCE).to_dataframe()
+    try:
+        df = _get_bq_client().query(_QUERY_PATIENCE).to_dataframe()
+    except Exception as exc:
+        st.error(f"Erro ao carregar feedbacks: {exc}")
+        return _EMPTY_PATIENCE.copy()
     df["createdAt"] = pd.to_datetime(
         df["createdAtSeconds"], unit="s", errors="coerce"
     )
     return df
 
 
+@st.cache_data
+def load_last_update() -> str:
+    try:
+        row = _get_bq_client().query(_QUERY_LAST_UPDATE).to_dataframe()
+        ts = row["last_update"].iloc[0]
+        if pd.isnull(ts):
+            return "N/D"
+        return pd.Timestamp(ts).tz_convert("America/Sao_Paulo").strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return "N/D"
+
+
 def clear_all_caches():
     load_users_sessions.clear()
     load_journeys.clear()
     load_patience.clear()
+    load_last_update.clear()
     build_desc_df.clear()
 
 
@@ -265,13 +312,14 @@ df = load_users_sessions()
 df_journeys = load_journeys()
 df_patience = load_patience()
 
-df_desc = build_desc_df(df)
+df_desc = build_desc_df(df) if not df.empty else pd.DataFrame()
 
 # Enriquece journeys com info de UBS do df de usuarios
-df_users_unique = df.drop_duplicates(subset="user_id")[
-    ["user_id", "ubs_name", "ubs_city", "phq_score", "gad_score", "gender", "age"]
-]
-df_journeys = df_journeys.merge(df_users_unique, on="user_id", how="left")
+if not df.empty and not df_journeys.empty and "user_id" in df.columns and "user_id" in df_journeys.columns:
+    df_users_unique = df.drop_duplicates(subset="user_id")[
+        ["user_id", "ubs_name", "ubs_city", "phq_score", "gad_score", "gender", "age"]
+    ]
+    df_journeys = df_journeys.merge(df_users_unique, on="user_id", how="left")
 
 # ---------------------------------------------------------------------------
 # Sidebar — navegação
@@ -293,6 +341,7 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Atualizar dados do BigQuery"):
     clear_all_caches()
     st.rerun()
+st.sidebar.caption(f"Última atualização: {load_last_update()}")
 
 # ---------------------------------------------------------------------------
 # Helpers — análise descritiva
