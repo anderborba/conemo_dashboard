@@ -209,6 +209,65 @@ def load_patience() -> pd.DataFrame:
 
 
 @st.cache_data
+def load_forms_web(_df: pd.DataFrame) -> pd.DataFrame:
+    """Extrai todos os registros de forms[] a partir de json_data_user."""
+    rows = []
+    for _, row in _df.drop_duplicates(subset="user_id").iterrows():
+        try:
+            data = json.loads(row["json_data_user"])
+            forms = data.get("forms", [])
+            for i, f in enumerate(forms):
+                date_val = f.get("date") or f.get("startedAt") or f.get("updatedAt")
+                if isinstance(date_val, dict):
+                    form_ts = pd.Timestamp(date_val.get("_seconds", 0), unit="s", tz="UTC")
+                else:
+                    form_ts = pd.to_datetime(date_val, errors="coerce", utc=True)
+
+                phq_score = gad_score = igi_score = None
+                phq_critical = gad_critical = igi_critical = False
+                phq_adverse  = gad_adverse  = igi_adverse  = False
+                for s in f.get("scores", []):
+                    t = s.get("type")
+                    if t == "PHQ":
+                        phq_score    = s.get("score");  phq_critical = s.get("critical", False);  phq_adverse = s.get("adverseEvent", False)
+                    elif t == "GAD":
+                        gad_score    = s.get("score");  gad_critical = s.get("critical", False);  gad_adverse = s.get("adverseEvent", False)
+                    elif t == "IGI":
+                        igi_score    = s.get("score");  igi_critical = s.get("critical", False);  igi_adverse = s.get("adverseEvent", False)
+
+                rows.append({
+                    "user_id":      row["user_id"],
+                    "ubs_name":     row.get("ubs_name"),
+                    "ubs_city":     row.get("ubs_city"),
+                    "form_index":   i,
+                    "form_date":    form_ts,
+                    "current":      f.get("current", False),
+                    "form_type":    f.get("followup") or "Baseline",
+                    "status":       f.get("status", "completed"),
+                    "submissionId": f.get("submissionId"),
+                    "currentStep":  f.get("currentStep"),
+                    "phq_score":    phq_score,
+                    "gad_score":    gad_score,
+                    "igi_score":    igi_score,
+                    "phq_critical": phq_critical,
+                    "gad_critical": gad_critical,
+                    "igi_critical": igi_critical,
+                    "phq_adverse":  phq_adverse,
+                    "gad_adverse":  gad_adverse,
+                    "igi_adverse":  igi_adverse,
+                    "n_answers":    len(f.get("answers", [])),
+                })
+        except Exception:
+            pass
+    if not rows:
+        return pd.DataFrame()
+    dfw = pd.DataFrame(rows)
+    for col in ["phq_score", "gad_score", "igi_score", "currentStep"]:
+        dfw[col] = pd.to_numeric(dfw[col], errors="coerce")
+    return dfw
+
+
+@st.cache_data
 def load_last_update() -> str:
     try:
         row = _get_bq_client().query(_QUERY_LAST_UPDATE).to_dataframe()
@@ -226,6 +285,8 @@ def clear_all_caches():
     load_patience.clear()
     load_last_update.clear()
     build_desc_df.clear()
+    load_forms_web.clear()
+    build_forms_items_df.clear()
 
 
 @st.cache_data
@@ -305,6 +366,87 @@ def build_desc_df(_df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1)
 
 
+@st.cache_data
+def build_forms_items_df(_df: pd.DataFrame) -> pd.DataFrame:
+    """Extrai respostas por item de todos os forms[] para análise descritiva."""
+    _KEYWORD_MAP = [
+        # PHQ-9
+        ("pouco interesse ou pouco prazer",       "phq1"),
+        ("deprimid",                               "phq2"),
+        ("pegar no sono ou permanecer dormindo",   "phq3"),
+        ("pouca energia",                          "phq4"),
+        ("falta de apetite",                       "phq5"),
+        ("fracasso ou",                            "phq6"),
+        ("dificuldade para se concentrar",         "phq7"),
+        ("lentidão para se movimentar",            "phq8"),
+        ("ferir de alguma maneira",                "phq9"),
+        # GAD-7
+        ("nervos",                                 "gad1"),
+        ("impedir ou de controlar as preocup",     "gad2"),
+        ("preocupar-se muito com diversas",        "gad3"),
+        ("dificuldade para relaxar",               "gad4"),
+        ("tão agitad",                             "gad5"),
+        ("facilmente aborrecid",                   "gad6"),
+        ("algo horrível fosse acontecer",          "gad7"),
+        # IGI
+        ("dificuldade em pegar no sono",           "igi1"),
+        ("dificuldade em manter o sono",           "igi2"),
+        ("despertar muito cedo",                   "igi3"),
+        ("padrão atual de seu sono",               "igi4"),
+        ("problema de sono interfere",             "igi5"),
+        ("outros percebem",                        "igi6"),
+        ("preocupad",                              "igi7"),
+        # SRAP
+        ("acabar com a sua vida",                  "srap1"),
+        ("como iria se matar",                     "srap2"),
+        ("plano atual para acabar",                "srap3"),
+        ("pílulas, arma",                          "srap4"),
+        ("prontamente disponíveis",                "srap5"),
+        ("quando irá acabar",                      "srap6"),
+        ("planejando fazer isso",                  "srap7"),
+        ("tentou acabar com sua",                  "srap8"),
+    ]
+
+    def _map_q(q_lower):
+        for kw, item in _KEYWORD_MAP:
+            if kw in q_lower:
+                return item
+        return None
+
+    rows = []
+    for _, user_row in _df.drop_duplicates(subset="user_id").iterrows():
+        try:
+            data = json.loads(user_row["json_data_user"])
+            for f in data.get("forms", []):
+                date_val = f.get("date") or f.get("startedAt")
+                if isinstance(date_val, dict):
+                    form_ts = pd.Timestamp(date_val.get("_seconds", 0), unit="s", tz="UTC")
+                else:
+                    form_ts = pd.to_datetime(date_val, errors="coerce", utc=True)
+
+                row = {
+                    "user_id":   user_row["user_id"],
+                    "ubs_name":  user_row.get("ubs_name"),
+                    "ubs_city":  user_row.get("ubs_city"),
+                    "form_date": form_ts,
+                    "form_type": f.get("followup") or "Baseline",
+                    "current":   f.get("current", False),
+                }
+                for ans in f.get("answers", []):
+                    q = ans.get("question", "").strip()
+                    a = ans.get("answer", "")
+                    item = _map_q(q.lower())
+                    if item and item not in row:
+                        row[item] = a if a != "" else None
+                rows.append(row)
+        except Exception:
+            pass
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Carrega os dados
 # ---------------------------------------------------------------------------
@@ -312,7 +454,9 @@ df = load_users_sessions()
 df_journeys = load_journeys()
 df_patience = load_patience()
 
-df_desc = build_desc_df(df) if not df.empty else pd.DataFrame()
+df_desc        = build_desc_df(df)         if not df.empty else pd.DataFrame()
+df_forms_web   = load_forms_web(df)        if not df.empty else pd.DataFrame()
+df_forms_items = build_forms_items_df(df)  if not df.empty else pd.DataFrame()
 
 # Enriquece journeys com info de UBS do df de usuarios
 if not df.empty and not df_journeys.empty and "user_id" in df.columns and "user_id" in df_journeys.columns:
@@ -335,6 +479,7 @@ page = st.sidebar.radio(
         "💬 Feedback de Pacientes",
         "👤 Por Participante",
         "📊 Análise Descritiva",
+        "📋 Formulário Web",
     ],
 )
 st.sidebar.markdown("---")
@@ -1486,3 +1631,279 @@ elif page == "📊 Análise Descritiva":
             st.markdown(f"**{label} ({col})**")
             _freq_table(df_desc[col], label)
             st.markdown("---")
+
+# ---------------------------------------------------------------------------
+# Página 7 — Formulário Web
+# ---------------------------------------------------------------------------
+elif page == "📋 Formulário Web":
+    st.title("Formulário Web — Estatísticas de Preenchimento")
+
+    if df_forms_web.empty:
+        st.info("Nenhum dado de formulário disponível.")
+        st.stop()
+
+    # ── KPIs ────────────────────────────────────────────────────────────────
+    total_pacientes  = df_forms_web["user_id"].nunique()
+    total_forms      = len(df_forms_web)
+    total_baseline   = (df_forms_web["form_type"] == "Baseline").sum()
+    total_followup   = (df_forms_web["form_type"] != "Baseline").sum()
+    forms_por_pac    = total_forms / total_pacientes if total_pacientes > 0 else 0
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Pacientes com formulário", total_pacientes)
+    m2.metric("Total de formulários",     total_forms)
+    m3.metric("Baseline",                 total_baseline)
+    m4.metric("Acompanhamento",           total_followup)
+    m5.metric("Média forms/paciente",     f"{forms_por_pac:.1f}")
+
+    st.markdown("---")
+
+    # ── Linha 1: tipo de formulário + timeline ──────────────────────────────
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Formulários por Tipo")
+        type_counts = (
+            df_forms_web["form_type"].value_counts()
+            .reset_index().rename(columns={"form_type": "Tipo", "count": "n"})
+        )
+        fig_type = px.bar(
+            type_counts.sort_values("n"),
+            x="n", y="Tipo", orientation="h",
+            color="n", color_continuous_scale="Blues",
+            labels={"n": "Formulários", "Tipo": "Tipo"},
+        )
+        fig_type.update_layout(showlegend=False, coloraxis_showscale=False, height=320, margin=dict(t=20, b=0))
+        st.plotly_chart(fig_type, width='stretch')
+
+    with col2:
+        st.subheader("Formulários ao Longo do Tempo")
+        df_tl = df_forms_web[df_forms_web["form_date"].notna()].copy()
+        if not df_tl.empty:
+            df_tl["mes"] = df_tl["form_date"].dt.tz_convert("America/Sao_Paulo").dt.to_period("M").astype(str)
+            timeline = df_tl.groupby(["mes", "form_type"]).size().reset_index(name="n")
+            fig_tl = px.bar(
+                timeline, x="mes", y="n", color="form_type",
+                labels={"mes": "Mês", "n": "Formulários", "form_type": "Tipo"},
+                barmode="stack",
+            )
+            fig_tl.update_layout(height=320, margin=dict(t=20, b=0), xaxis_title="Mês")
+            st.plotly_chart(fig_tl, width='stretch')
+        else:
+            st.info("Datas não disponíveis para análise temporal.")
+
+    st.markdown("---")
+
+    # ── Linha 2: scores PHQ e GAD ───────────────────────────────────────────
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.subheader("Distribuição PHQ-9")
+        s_phq = df_forms_web["phq_score"].dropna()
+        if not s_phq.empty:
+            st.caption(f"n={len(s_phq)}  |  Média: {s_phq.mean():.1f}  |  Mediana: {s_phq.median():.1f}  |  DP: {s_phq.std():.1f}")
+            fig_phq = px.histogram(
+                s_phq, nbins=28,
+                labels={"value": "PHQ-9", "count": "n"},
+                color_discrete_sequence=["#EF553B"],
+            )
+            fig_phq.update_layout(showlegend=False, height=300, margin=dict(t=20, b=0))
+            st.plotly_chart(fig_phq, width='stretch')
+        else:
+            st.info("Scores PHQ não disponíveis.")
+
+    with col4:
+        st.subheader("Distribuição GAD-7")
+        s_gad = df_forms_web["gad_score"].dropna()
+        if not s_gad.empty:
+            st.caption(f"n={len(s_gad)}  |  Média: {s_gad.mean():.1f}  |  Mediana: {s_gad.median():.1f}  |  DP: {s_gad.std():.1f}")
+            fig_gad = px.histogram(
+                s_gad, nbins=21,
+                labels={"value": "GAD-7", "count": "n"},
+                color_discrete_sequence=["#636EFA"],
+            )
+            fig_gad.update_layout(showlegend=False, height=300, margin=dict(t=20, b=0))
+            st.plotly_chart(fig_gad, width='stretch')
+        else:
+            st.info("Scores GAD não disponíveis.")
+
+    st.markdown("---")
+
+    # ── Linha 3: IGI + eventos críticos/adversos ────────────────────────────
+    col5, col6 = st.columns(2)
+
+    with col5:
+        st.subheader("Distribuição IGI")
+        s_igi = df_forms_web["igi_score"].dropna()
+        if not s_igi.empty:
+            st.caption(f"n={len(s_igi)}  |  Média: {s_igi.mean():.1f}  |  Mediana: {s_igi.median():.1f}  |  DP: {s_igi.std():.1f}")
+            fig_igi = px.histogram(
+                s_igi, nbins=28,
+                labels={"value": "IGI", "count": "n"},
+                color_discrete_sequence=["#AB63FA"],
+            )
+            fig_igi.update_layout(showlegend=False, height=300, margin=dict(t=20, b=0))
+            st.plotly_chart(fig_igi, width='stretch')
+        else:
+            st.info("Scores IGI não disponíveis.")
+
+    with col6:
+        st.subheader("Eventos Críticos e Adversos")
+        eventos = []
+        for escala, col_crit, col_adv in [
+            ("PHQ-9", "phq_critical", "phq_adverse"),
+            ("GAD-7", "gad_critical", "gad_adverse"),
+            ("IGI",   "igi_critical", "igi_adverse"),
+        ]:
+            n_total = df_forms_web[col_crit].notna().sum()
+            n_crit  = int(df_forms_web[col_crit].sum())
+            n_adv   = int(df_forms_web[col_adv].sum())
+            if n_total > 0:
+                eventos.append({
+                    "Escala":    escala,
+                    "Críticos":  n_crit,
+                    "% Críticos": f"{n_crit / n_total * 100:.1f}%",
+                    "Adversos":  n_adv,
+                    "% Adversos": f"{n_adv / n_total * 100:.1f}%",
+                })
+        if eventos:
+            st.dataframe(pd.DataFrame(eventos), hide_index=True, use_container_width=True)
+        else:
+            st.info("Dados de eventos não disponíveis.")
+
+    st.markdown("---")
+
+    # ── Tabela detalhada por paciente ───────────────────────────────────────
+    st.subheader("Detalhe por Paciente")
+    resumo = (
+        df_forms_web.groupby("user_id")
+        .apply(lambda g: pd.Series({
+            "UBS":              g["ubs_name"].iloc[0],
+            "Cidade":           g["ubs_city"].iloc[0],
+            "Formulários":      len(g),
+            "Baseline":         (g["form_type"] == "Baseline").sum(),
+            "Acompanhamento":   (g["form_type"] != "Baseline").sum(),
+            "PHQ atual":        g.loc[g["current"] == True, "phq_score"].iloc[0] if (g["current"] == True).any() else None,
+            "GAD atual":        g.loc[g["current"] == True, "gad_score"].iloc[0] if (g["current"] == True).any() else None,
+            "IGI atual":        g.loc[g["current"] == True, "igi_score"].iloc[0] if (g["current"] == True).any() else None,
+            "PHQ crítico":      "Sim" if g["phq_critical"].any() else "Não",
+        }), include_groups=False)
+        .reset_index()
+    )
+    st.dataframe(resumo, hide_index=True, use_container_width=True)
+    st.download_button(
+        "⬇️ CSV", resumo.to_csv(index=False).encode("utf-8"),
+        "formulario_web_por_paciente.csv", "text/csv", key="dl_forms_web"
+    )
+
+    # ── Análise descritiva por instrumento ──────────────────────────────────
+    st.markdown("---")
+    st.subheader("Análise Descritiva por Instrumento")
+
+    if df_forms_items.empty:
+        st.info("Dados de itens não disponíveis.")
+        st.stop()
+
+    form_types_all = sorted(df_forms_items["form_type"].unique())
+    sel_fi_types = st.multiselect(
+        "Tipo de formulário", form_types_all, default=form_types_all, key="fi_type_sel"
+    )
+    df_fi = df_forms_items[df_forms_items["form_type"].isin(sel_fi_types)] if sel_fi_types else df_forms_items
+    dfw_fi = df_forms_web[df_forms_web["form_type"].isin(sel_fi_types)] if sel_fi_types else df_forms_web
+    st.caption(f"Formulários analisados: **{len(df_fi)}**  |  Pacientes: **{df_fi['user_id'].nunique()}**")
+
+    tabs_desc = st.tabs(["PHQ-9", "GAD-7", "IGI", "Risco de Suicídio"])
+
+    # ── Tab PHQ-9 ────────────────────────────────────────────────────────────
+    with tabs_desc[0]:
+        st.subheader("PHQ-9 — Depressão")
+        _stats_table(dfw_fi["phq_score"], "PHQ-9 Score")
+        st.markdown("---")
+        grav_phq = dfw_fi["phq_score"].dropna().apply(_phq_gravity)
+        _freq_table(grav_phq, "Gravidade PHQ-9")
+        st.markdown("---")
+
+        phq_items = {
+            "phq1": "PHQ1 — Pouco interesse ou prazer nas atividades",
+            "phq2": "PHQ2 — Humor deprimido / sem perspectiva",
+            "phq3": "PHQ3 — Distúrbio do sono",
+            "phq4": "PHQ4 — Fadiga / pouca energia",
+            "phq5": "PHQ5 — Alteração de apetite",
+            "phq6": "PHQ6 — Autopercepção negativa / sentimento de fracasso",
+            "phq7": "PHQ7 — Dificuldade de concentração",
+            "phq8": "PHQ8 — Agitação psicomotora ou lentidão",
+            "phq9": "PHQ9 — Pensamentos de automutilação ou morte",
+        }
+        for col, label in phq_items.items():
+            if col in df_fi.columns and df_fi[col].notna().any():
+                st.markdown(f"**{label}**")
+                _freq_table(df_fi[col], label)
+                st.markdown("---")
+
+    # ── Tab GAD-7 ────────────────────────────────────────────────────────────
+    with tabs_desc[1]:
+        st.subheader("GAD-7 — Ansiedade")
+        _stats_table(dfw_fi["gad_score"], "GAD-7 Score")
+        st.markdown("---")
+        grav_gad = dfw_fi["gad_score"].dropna().apply(_gad_gravity)
+        _freq_table(grav_gad, "Gravidade GAD-7")
+        st.markdown("---")
+
+        gad_items = {
+            "gad1": "GAD1 — Nervosismo / ansiedade / tensão",
+            "gad2": "GAD2 — Incapacidade de controlar preocupações",
+            "gad3": "GAD3 — Preocupação excessiva com diversas coisas",
+            "gad4": "GAD4 — Dificuldade para relaxar",
+            "gad5": "GAD5 — Agitação / inquietação",
+            "gad6": "GAD6 — Irritabilidade",
+            "gad7": "GAD7 — Sensação de algo horrível prestes a acontecer",
+        }
+        for col, label in gad_items.items():
+            if col in df_fi.columns and df_fi[col].notna().any():
+                st.markdown(f"**{label}**")
+                _freq_table(df_fi[col], label)
+                st.markdown("---")
+
+    # ── Tab IGI ──────────────────────────────────────────────────────────────
+    with tabs_desc[2]:
+        st.subheader("IGI — Insônia")
+        _stats_table(dfw_fi["igi_score"], "IGI Score")
+        st.markdown("---")
+        grav_igi = dfw_fi["igi_score"].dropna().apply(_igi_gravity)
+        _freq_table(grav_igi, "Gravidade IGI")
+        st.markdown("---")
+
+        igi_items = {
+            "igi1": "IGI1 — Dificuldade em pegar no sono",
+            "igi2": "IGI2 — Dificuldade em manter o sono",
+            "igi3": "IGI3 — Despertar muito cedo",
+            "igi4": "IGI4 — Satisfação com o padrão de sono",
+            "igi5": "IGI5 — Interferência do sono nas atividades diurnas",
+            "igi6": "IGI6 — Percepção dos outros sobre o problema de sono",
+            "igi7": "IGI7 — Preocupação / estresse com o sono",
+        }
+        for col, label in igi_items.items():
+            if col in df_fi.columns and df_fi[col].notna().any():
+                st.markdown(f"**{label}**")
+                _freq_table(df_fi[col], label)
+                st.markdown("---")
+
+    # ── Tab Risco de Suicídio ────────────────────────────────────────────────
+    with tabs_desc[3]:
+        st.subheader("Risco de Suicídio — SRAP")
+
+        srap_items = {
+            "srap1": "SRAP1 — Pensou em acabar com a vida nas últimas 2 semanas",
+            "srap2": "SRAP2 — Pensou em como se matar",
+            "srap3": "SRAP3 — Tem plano atual para acabar com a vida",
+            "srap4": "SRAP4 — Tem meios (pílulas, arma, etc.)",
+            "srap5": "SRAP5 — Meios prontamente disponíveis",
+            "srap6": "SRAP6 — Decidiu quando vai se matar",
+            "srap7": "SRAP7 — Planeja fazê-lo hoje ou em breve",
+            "srap8": "SRAP8 — Tentativa recente de suicídio",
+        }
+        for col, label in srap_items.items():
+            if col in df_fi.columns and df_fi[col].notna().any():
+                st.markdown(f"**{label}**")
+                _freq_table(df_fi[col], label)
+                st.markdown("---")
