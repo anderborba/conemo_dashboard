@@ -226,14 +226,22 @@ def load_forms_web(_df: pd.DataFrame) -> pd.DataFrame:
                 phq_score = gad_score = igi_score = None
                 phq_critical = gad_critical = igi_critical = False
                 phq_adverse  = gad_adverse  = igi_adverse  = False
+                score_types = set()
                 for s in f.get("scores", []):
                     t = s.get("type")
+                    score_types.add(t)
                     if t == "PHQ":
                         phq_score    = s.get("score");  phq_critical = s.get("critical", False);  phq_adverse = s.get("adverseEvent", False)
                     elif t == "GAD":
                         gad_score    = s.get("score");  gad_critical = s.get("critical", False);  gad_adverse = s.get("adverseEvent", False)
                     elif t == "IGI":
                         igi_score    = s.get("score");  igi_critical = s.get("critical", False);  igi_adverse = s.get("adverseEvent", False)
+
+                # Completude: status = "completed" → completo
+                # Sem status (dados legados) → tratar como completed (retrocompatibilidade)
+                # status = "in_progress" → abandonado
+                _status = f.get("status", "completed")
+                is_complete = (_status == "completed")
 
                 rows.append({
                     "user_id":      row["user_id"],
@@ -243,9 +251,13 @@ def load_forms_web(_df: pd.DataFrame) -> pd.DataFrame:
                     "form_date":    form_ts,
                     "current":      f.get("current", False),
                     "form_type":    f.get("followup") or "Baseline",
-                    "status":       f.get("status", "completed"),
+                    "status":       _status,
+                    "is_complete":  is_complete,
                     "submissionId": f.get("submissionId"),
                     "currentStep":  f.get("currentStep"),
+                    "startedAt":    pd.to_datetime(f.get("startedAt"),   errors="coerce", utc=True),
+                    "updatedAt":    pd.to_datetime(f.get("updatedAt"),   errors="coerce", utc=True),
+                    "completedAt":  pd.to_datetime(f.get("completedAt"), errors="coerce", utc=True),
                     "phq_score":    phq_score,
                     "gad_score":    gad_score,
                     "igi_score":    igi_score,
@@ -1794,6 +1806,229 @@ elif page == "📋 Formulário Web":
     st.download_button(
         "⬇️ CSV", resumo.to_csv(index=False).encode("utf-8"),
         "formulario_web_por_paciente.csv", "text/csv", key="dl_forms_web"
+    )
+
+    # ── Análise de sessões de preenchimento ─────────────────────────────────
+    st.markdown("---")
+    st.subheader("Análise de Sessões de Preenchimento")
+
+    # Pacientes com ao menos 1 formulário
+    pacs_com_form = set(df_forms_web["user_id"].unique())
+    # Todos os pacientes conhecidos (do df principal)
+    pacs_total = set(df.drop_duplicates(subset="user_id")["user_id"].unique())
+    pacs_sem_form = pacs_total - pacs_com_form
+
+    df_sub = df_forms_web.copy()
+
+    # ── Categorização por paciente (nível de paciente — regra do contrato) ────
+    # Paciente concluinte = tem ao menos 1 status="completed"
+    # Paciente abandonante = nenhum status="completed"
+    # Abandonou e retomou = tem ambos in_progress e completed
+    def _cat_patient(g):
+        has_done   = (g["status"] == "completed").any()
+        has_inprog = (g["status"] == "in_progress").any()
+        if has_done and has_inprog:
+            return "Abandonou e retomou"
+        elif has_done:
+            return "Concluiu"
+        else:
+            return "Abandonou (não concluiu)"
+
+    pat_cats = (
+        df_sub.groupby("user_id")
+        .apply(_cat_patient, include_groups=False)
+        .reset_index(name="categoria")
+    )
+
+    # ── Métricas de sessão: count(distinct submissionId) scoped por user_id ─
+    # Contrato: nunca usar count(distinct submissionId) sem GROUP BY user_id
+    has_sub = df_sub["submissionId"].notna().any()
+    if has_sub:
+        df_s = df_sub[df_sub["submissionId"].notna()]
+        total_sess  = int(df_s.groupby("user_id")["submissionId"].nunique().sum())
+        n_completas = int(df_s[df_s["status"] == "completed"]
+                          .groupby("user_id")["submissionId"].nunique().sum())
+        n_inprog    = int(df_s[df_s["status"] == "in_progress"]
+                          .groupby("user_id")["submissionId"].nunique().sum())
+    else:
+        # Dados legados: sem submissionId — status ausente = completed
+        total_sess  = len(df_sub)
+        n_completas = int((df_sub["status"] == "completed").sum())
+        n_inprog    = int((df_sub["status"] == "in_progress").sum())
+
+    # Métricas de paciente (abandono = nível de paciente per contrato)
+    n_nunca_iniciou = len(pacs_sem_form)
+    n_pac_abandonou = int((pat_cats["categoria"] == "Abandonou (não concluiu)").sum())
+    n_pac_retomou   = int((pat_cats["categoria"] == "Abandonou e retomou").sum())
+
+    taxa_conclusao  = n_completas / total_sess * 100 if total_sess > 0 else 0
+    taxa_abandono   = n_inprog    / total_sess * 100 if total_sess > 0 else 0
+
+    # ── KPIs (linha 1: sessões; linha 2: pacientes) ──────────────────────────
+    st.markdown("**Sessões**")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Iniciadas",             total_sess,
+              help="count(distinct submissionId) por user_id")
+    m2.metric("Completas",             n_completas,
+              help="status = 'completed'")
+    m3.metric("Em progresso / Aband.", n_inprog,
+              help="status = 'in_progress'")
+    m4.metric("Taxa de conclusão",     f"{taxa_conclusao:.1f}%",
+              help="completed / started")
+    m5.metric("Taxa de abandono",      f"{taxa_abandono:.1f}%",
+              help="in_progress / started")
+
+    st.markdown("**Pacientes**")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Nunca iniciaram",         n_nunca_iniciou)
+    p2.metric("Concluíram",              int((pat_cats["categoria"] == "Concluiu").sum()))
+    p3.metric("Abandonaram (sem retomada)", n_pac_abandonou,
+              help="Nenhum status='completed' — definição nível de paciente")
+    p4.metric("Abandonaram e retomaram", n_pac_retomou)
+
+    st.markdown("---")
+
+    # ── Linha 1: perfil dos pacientes + dropoff por step ────────────────────
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Perfil dos Pacientes por Desfecho")
+        _color_map = {
+            "Nunca iniciou":            "#AEC7E8",
+            "Concluiu":                 "#2CA02C",
+            "Abandonou e retomou":      "#FF7F0E",
+            "Abandonou (não concluiu)": "#D62728",
+        }
+        cat_all = pat_cats["categoria"].value_counts().to_dict()
+        cat_all["Nunca iniciou"] = n_nunca_iniciou
+        cat_df = pd.DataFrame(
+            [{"Categoria": k, "n": v} for k, v in cat_all.items()]
+        )
+        fig_cat = px.pie(
+            cat_df, names="Categoria", values="n",
+            color="Categoria", color_discrete_map=_color_map,
+            hole=0.45,
+        )
+        fig_cat.update_traces(textinfo="percent+label")
+        fig_cat.update_layout(showlegend=False, height=360, margin=dict(t=20, b=0))
+        st.plotly_chart(fig_cat, width='stretch')
+
+    with col2:
+        st.subheader("Dropoff por Step (sessões abandonadas)")
+        df_ab_step = df_sub[
+            (df_sub["status"] == "in_progress") & df_sub["currentStep"].notna()
+        ]
+        if not df_ab_step.empty:
+            step_counts = (
+                df_ab_step["currentStep"].astype(int)
+                .value_counts().sort_index().reset_index()
+            )
+            step_counts.columns = ["Step", "n"]
+            fig_drop = px.bar(
+                step_counts, x="Step", y="n",
+                labels={"Step": "currentStep (índice)", "n": "Sessões paradas"},
+                color="n", color_continuous_scale="Reds",
+            )
+            fig_drop.update_layout(
+                showlegend=False, coloraxis_showscale=False,
+                height=360, margin=dict(t=20, b=0),
+            )
+            st.plotly_chart(fig_drop, width='stretch')
+        else:
+            st.info("Dados de step registrados quando o salvamento parcial estiver ativo.")
+
+    st.markdown("---")
+
+    # ── Linha 2: tempo para completar vs abandonar ──────────────────────────
+    df_tc = df_sub[
+        (df_sub["status"] == "completed") &
+        df_sub["startedAt"].notna() & df_sub["completedAt"].notna()
+    ].copy()
+    if not df_tc.empty:
+        df_tc["min"] = (df_tc["completedAt"] - df_tc["startedAt"]).dt.total_seconds() / 60
+        df_tc = df_tc[df_tc["min"] >= 0]
+
+    df_ta = df_sub[
+        (df_sub["status"] == "in_progress") &
+        df_sub["startedAt"].notna() & df_sub["updatedAt"].notna()
+    ].copy()
+    if not df_ta.empty:
+        df_ta["min"] = (df_ta["updatedAt"] - df_ta["startedAt"]).dt.total_seconds() / 60
+        df_ta = df_ta[df_ta["min"] >= 0]
+
+    if df_tc.empty and df_ta.empty:
+        st.info("Tempo de preenchimento disponível quando os campos `startedAt`, `completedAt` e `updatedAt` estiverem presentes nos dados.")
+    else:
+        col3, col4 = st.columns(2)
+        with col3:
+            st.subheader("Tempo para Concluir (minutos)")
+            if not df_tc.empty:
+                st.caption(f"n={len(df_tc)}  |  Média: {df_tc['min'].mean():.1f} min  |  Mediana: {df_tc['min'].median():.1f} min  |  DP: {df_tc['min'].std():.1f}")
+                fig_tc = px.histogram(df_tc, x="min", nbins=20, labels={"min": "Minutos", "count": "n"}, color_discrete_sequence=["#2CA02C"])
+                fig_tc.update_layout(showlegend=False, height=300, margin=dict(t=20, b=0))
+                st.plotly_chart(fig_tc, width='stretch')
+            else:
+                st.info("Sem dados de tempo para sessões completas.")
+        with col4:
+            st.subheader("Tempo até Abandono (minutos)")
+            if not df_ta.empty:
+                st.caption(f"n={len(df_ta)}  |  Média: {df_ta['min'].mean():.1f} min  |  Mediana: {df_ta['min'].median():.1f} min  |  DP: {df_ta['min'].std():.1f}")
+                fig_ta = px.histogram(df_ta, x="min", nbins=20, labels={"min": "Minutos", "count": "n"}, color_discrete_sequence=["#D62728"])
+                fig_ta.update_layout(showlegend=False, height=300, margin=dict(t=20, b=0))
+                st.plotly_chart(fig_ta, width='stretch')
+            else:
+                st.info("Sem dados de tempo para sessões abandonadas.")
+
+    st.markdown("---")
+
+    # ── Linha 3: evolução temporal das sessões ──────────────────────────────
+    st.subheader("Evolução Temporal das Sessões")
+    df_tl_sub = df_sub.copy()
+    ref_ts = pd.to_datetime(
+        df_tl_sub["startedAt"].where(df_tl_sub["startedAt"].notna(), df_tl_sub["form_date"]),
+        utc=True, errors="coerce",
+    )
+    df_tl_sub["data"] = ref_ts.dt.tz_convert("America/Sao_Paulo").dt.date
+    if df_tl_sub["data"].notna().any():
+        df_tl_sub["desfecho"] = df_tl_sub["status"].map({"completed": "Completa", "in_progress": "Abandonada"}).fillna("Completa")
+        tl = df_tl_sub.groupby(["data", "desfecho"]).size().reset_index(name="n")
+        tl["data"] = pd.to_datetime(tl["data"])
+        fig_tl = px.bar(
+            tl, x="data", y="n", color="desfecho",
+            color_discrete_map={"Completa": "#2CA02C", "Abandonada": "#D62728"},
+            labels={"data": "Data", "n": "Sessões", "desfecho": "Desfecho"},
+            barmode="stack",
+        )
+        fig_tl.update_layout(height=320, margin=dict(t=20, b=0))
+        st.plotly_chart(fig_tl, width='stretch')
+    else:
+        st.info("Datas não disponíveis para análise temporal.")
+
+    st.markdown("---")
+
+    # ── Tabela de detalhe por paciente ──────────────────────────────────────
+    st.subheader("Detalhe por Paciente — Sessões")
+    resumo_sub = (
+        df_sub.merge(pat_cats, on="user_id", how="left")
+        .groupby("user_id")
+        .apply(lambda g: pd.Series({
+            "UBS":               g["ubs_name"].iloc[0],
+            "Cidade":            g["ubs_city"].iloc[0],
+            "Categoria":         g["categoria"].iloc[0],
+            "Sessões totais":    len(g),
+            "Completas":         int((g["status"].fillna("completed") == "completed").sum()),
+            "Abandonadas":       int((g["status"] == "in_progress").sum()),
+            "Último step":       int(g.loc[g["status"] == "in_progress", "currentStep"].dropna().max())
+                                 if (g["status"] == "in_progress").any() and
+                                    g.loc[g["status"] == "in_progress", "currentStep"].notna().any()
+                                 else None,
+        }), include_groups=False)
+        .reset_index()
+    )
+    st.dataframe(resumo_sub, hide_index=True, use_container_width=True)
+    st.download_button(
+        "⬇️ CSV", resumo_sub.to_csv(index=False).encode("utf-8"),
+        "sessoes_por_paciente.csv", "text/csv", key="dl_sessoes"
     )
 
     # ── Análise descritiva por instrumento ──────────────────────────────────
